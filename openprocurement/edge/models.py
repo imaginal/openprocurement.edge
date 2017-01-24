@@ -24,7 +24,7 @@ class ApiRequest(Model):
 
 class ApiResponse(Model):
 
-    date = IsoDateTimeType()
+    date = IsoDateTimeType(required=True)
     status_code = IntType()
     location = StringType()
     requestID = StringType()
@@ -57,14 +57,14 @@ class Task(SchematicsDocument, Model):
             'default': schematics_default_role,
         }
 
-    date = IsoDateTimeType()
+    acquired = IsoDateTimeType()
+    date = IsoDateTimeType(required=True)
     name = StringType(required=True)
     user = StringType(required=True)
     status = StringType(choices=['new', 'success', 'error', 'failed'], default='new')
     request = ModelType(ApiRequest, required=True)
     response = ModelType(ApiResponse)
     errors = ListType(ModelType(ApiResponse))
-    dateLastRun = IsoDateTimeType()
 
     def get_role(self):
         return 'default'

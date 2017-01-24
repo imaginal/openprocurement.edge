@@ -110,7 +110,7 @@ def save_access_token(request, res, user=None):
     if not access or not access.get('token'):
         return
     path = res.headers.get('Location', '/')
-    token_id = path.rsplit('/', 1)[1]       # maybe not safe
+    token_id = path.rsplit('/', 1)[1]  # maybe not safe
     pos = path.find('/api/')
     if pos > 0:
         pos = path.find('/', pos + 5)
@@ -119,6 +119,7 @@ def save_access_token(request, res, user=None):
         token_id = utils.generate_id()
     if not user:
         user = request.validated['user_token']
+    token_id += '-token'
     token = Token(dict(
         id=token_id,
         date=get_now(),
@@ -133,7 +134,7 @@ def save_access_token(request, res, user=None):
 def run_task(request, acquired=False):
     task = request.validated['task']
     if not acquired:
-        task.dateLastRun = get_now()
+        task.acquired = get_now()
         if not save_task(request):
             return
 
@@ -230,7 +231,7 @@ def create_task(request, task_name, run=False):
     if token:
         task.request.acc_token = token
     if run:
-        task.dateLastRun = get_now()
+        task.acquired = get_now()
     request.validated['task_id'] = task_id
     request.validated['task'] = task
     request.response.headers['X-Task-ID'] = task_id
