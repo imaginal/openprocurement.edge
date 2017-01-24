@@ -163,7 +163,7 @@ class EdgeDataBridge(object):
         while 1:
             try:
                 api_client = self.api_clients_queue.get(timeout=self.queue_timeout)
-                logger.info('Got api_client {}'.format(
+                logger.debug('Got api_client {}'.format(
                     api_client.session.headers['User-Agent']
                 ))
             except Empty:
@@ -181,7 +181,8 @@ class EdgeDataBridge(object):
             except Exception as e:
                 self.api_clients_queue.put(api_client)
                 logger.error('Error while getting resource item from api' \
-                             ' server {}: '.format(e.message))
+                             ' server: {} client {}'.format(e.message,
+                              api_client.session.headers['User-Agent']))
                 self.add_to_retry_queue({
                     'id': queue_resource_item['id'],
                     'dateModified': queue_resource_item['dateModified']

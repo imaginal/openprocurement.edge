@@ -10,8 +10,8 @@ from openprocurement.api.design import (
     tenders_test_by_local_seq_view,
 )
 
-from openprocurement.edge.utils import opresource, clean_up_doc
-from openprocurement.api.utils import context_unpack, decrypt, encrypt, json_view, APIResource
+from openprocurement.edge.utils import opresource, clean_up_doc, json_view
+from openprocurement.api.utils import context_unpack, decrypt, encrypt, APIResource
 
 VIEW_MAP = {
     u'': tenders_real_by_dateModified_view,
@@ -188,9 +188,9 @@ class TenderResource(APIResource):
     @json_view()
     def get(self):
         tender = clean_up_doc(self.request.validated['tender'])
-        return {'data': tender}
+        return {'data': tender.serialize(tender.status)}
 
-
+"""
 @opresource(name='Tender Items',
             path='/tenders/{tender_id}/*items',
             description="Open Contracting compatible data exchange format. See http://ocds.open-contracting.org/standard/r/master/#tender for more info")
@@ -199,3 +199,4 @@ class TenderItemsResource(APIResource):
     @json_view()
     def get(self):
         return {'data': self.request.validated['item']}
+"""
