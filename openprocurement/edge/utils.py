@@ -119,7 +119,7 @@ def save_access_token(request, res, user=None):
         token_id = utils.generate_id()
     if not user:
         user = request.validated['user_token']
-    token_id += '-token'
+    token_id += '.token'
     token = Token(dict(
         id=token_id,
         date=get_now(),

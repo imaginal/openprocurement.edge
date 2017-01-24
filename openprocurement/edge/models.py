@@ -57,12 +57,12 @@ class Task(SchematicsDocument, Model):
             'default': schematics_default_role,
         }
 
-    acquired = IsoDateTimeType()
     date = IsoDateTimeType(required=True)
     name = StringType(required=True)
     user = StringType(required=True)
     status = StringType(choices=['new', 'success', 'error', 'failed'], default='new')
     request = ModelType(ApiRequest, required=True)
+    acquired = IsoDateTimeType()
     response = ModelType(ApiResponse)
     errors = ListType(ModelType(ApiResponse))
 
