@@ -8,15 +8,16 @@ import os
 from couchdb import Server as CouchdbServer, Session
 from couchdb.http import Unauthorized, extract_credentials
 from libnacl.sign import Signer, Verifier
-from openprocurement.edge.auth import AuthenticationPolicy, authenticated_role, check_accreditation
-from openprocurement.edge.utils import opresource, extract_tender, tender_from_data
+from openprocurement.edge.auth import authenticated_role, check_accreditation
+# important to import edge.utils bofore api.utils for monkey patching
+from openprocurement.edge.utils import extract_tender, tender_from_data, dry_run
 
 from openprocurement.api.design import sync_design
 from openprocurement.api.models import Tender
 from openprocurement.api.utils import (forbidden, isTender, request_params, set_renderer,
     register_tender_procurementMethodType, beforerender, add_logging_context, set_logging_context)
 
-#from pyramid.authorization import ACLAuthorizationPolicy as AuthorizationPolicy
+# from pyramid.authorization import ACLAuthorizationPolicy as AuthorizationPolicy
 from pyramid.config import Configurator
 from pyramid.events import NewRequest, BeforeRender, ContextFound
 from pyramid.renderers import JSON, JSONP
@@ -73,6 +74,7 @@ def main(global_config, **settings):
     config.add_request_method(authenticated_role, reify=True)
     config.add_request_method(extract_tender, 'tender', reify=True)
     config.add_request_method(check_accreditation)
+    config.add_request_method(dry_run, property=True)
     config.add_renderer('prettyjson', JSON(indent=4))
     config.add_renderer('jsonp', JSONP(param_name='opt_jsonp'))
     config.add_renderer('prettyjsonp', JSONP(indent=4, param_name='opt_jsonp'))
@@ -122,6 +124,6 @@ def main(global_config, **settings):
     config.registry.server_id = settings.get('id', '')
     config.registry.health_threshold = float(settings.get('health_threshold', 99))
     config.registry.update_after = asbool(settings.get('update_after', True))
-    config.registry.dry_run = asbool(settings.get('dry_run', False))
+    config.registry.dry_run = False  # asbool(settings.get('dry_run', False))
     config.registry.api_version = version
     return config.make_wsgi_app()

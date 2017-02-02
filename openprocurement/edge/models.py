@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import re
 import json
 from couchdb_schematics.document import SchematicsDocument
 from zope.interface import implementer, Interface
@@ -90,6 +91,17 @@ class Task(SchematicsDocument, Model):
         if self.errors is None:
             self.errors = list()
         self.errors.append(response)
+
+    def get_location(self):
+        if not self.response or not self.response.location:
+            return ''
+        try:
+            location = str(self.response.location)
+        except:
+            location = '<error>'
+        # if '://' in location:
+        #    location = re.sub(r'^\w+://[^/]+', '', location)
+        return location
 
     def response_json(self):
         if self.response:
