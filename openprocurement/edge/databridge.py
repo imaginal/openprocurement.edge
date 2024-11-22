@@ -45,6 +45,9 @@ WORKER_CONFIG = {
     'retry_default_timeout': 3,
     'retries_count': 10,
     'queue_timeout': 3,
+    'archive_status': 'complete,cancelled,unsuccessful',
+    'sync_worker_sleep': 5,
+    'sync_worker_stat': 1000,
     'bulk_save_limit': 1000,
     'bulk_save_interval': 5
 }
@@ -73,6 +76,8 @@ DEFAULTS = {
     'bulk_query_limit': 1000,
     'couch_url': 'http://127.0.0.1:5984',
     'db_name': 'edge_db',
+    'archive': False,
+    'sync_archive': 'yes',
     'perfomance_window': 300
 }
 
@@ -91,7 +96,7 @@ class EdgeDataBridge(object):
         self.retrievers_params = self.config_get('retrievers_params')
 
         # Check up_wait_sleep
-        up_wait_sleep = self.retrievers_params.get('up_wait_sleep')
+        up_wait_sleep = self.retrievers_params.get('up_wait_sleep', 30.0)
         if up_wait_sleep is not None and up_wait_sleep < 30:
             raise DataBridgeConfigError('Invalid \'up_wait_sleep\' in '
                                         '\'retrievers_params\'. Value must be '
@@ -142,6 +147,15 @@ class EdgeDataBridge(object):
         else:
             raise DataBridgeConfigError('In config dictionary empty or missing'
                                         ' \'tenders_api_server\'')
+        if self.archive:
+            if '-' in self.archive:
+                afrom, ato = map(int, self.archive.split('-'))
+                self.archive = range(afrom, ato + 1)
+            else:
+                self.archive = map(int, self.archive.split(','))
+            self.open_archive_dbs()
+            self.db_name += '_main'
+        logger.info('Open database {}'.format(self.db_name))
         self.db = prepare_couchdb(self.couch_url, self.db_name, logger)
         db_url = self.couch_url + '/' + self.db_name
         prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
@@ -149,6 +163,12 @@ class EdgeDataBridge(object):
                              session=Session(retry_delays=range(10)))
         self.view_path = '_design/{}/_view/by_dateModified'.format(
             self.workers_config['resource'])
+        # check and sync archive dbs
+        if self.archive and self.dbs:
+            ResourceItemWorker(None, None,
+                               self.db, self.dbs, self.workers_config,
+                               self.retry_resource_items_queue,
+                               None).sync_archive_dbs()
         extra_params = {
             'mode': self.retrieve_mode,
             'limit': self.resource_items_limit
@@ -160,6 +180,16 @@ class EdgeDataBridge(object):
                                      retrievers_params=self.retrievers_params,
                                      adaptive=True, with_priority=True)
         self.api_clients_info = {}
+
+    def open_archive_dbs(self):
+        self.dbs = {}
+        for year in self.archive:
+            year = str(year)
+            db_name = self.db_name + '_' + year
+            logger.info('Open archive: {}'.format(db_name))
+            self.dbs[year] = prepare_couchdb(self.couch_url, db_name, logger)
+            db_url = self.couch_url + '/' + db_name
+            prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
 
     def config_get(self, name):
         try:
@@ -176,7 +206,8 @@ class EdgeDataBridge(object):
                 api_client = APIClient(
                     host_url=self.api_host, user_agent=client_user_agent,
                     api_version=self.api_version, key='',
-                    resource=self.workers_config['resource'])
+                    resource=self.workers_config['resource'],
+                    allow_insecure=self.retrievers_params.get('allow_insecure'))
                 client_id = uuid.uuid4().hex
                 logger.info('Started api_client {}'.format(
                     api_client.session.headers['User-Agent']),
@@ -349,7 +380,7 @@ class EdgeDataBridge(object):
                 self.create_api_client()
                 w = ResourceItemWorker.spawn(self.api_clients_queue,
                                              self.resource_items_queue,
-                                             self.db, self.workers_config,
+                                             self.db, self.dbs, self.workers_config,
                                              self.retry_resource_items_queue,
                                              self.api_clients_info)
                 self.workers_pool.add(w)
@@ -413,7 +444,7 @@ class EdgeDataBridge(object):
             for i in xrange(0, (self.workers_min - len(self.workers_pool))):
                 w = ResourceItemWorker.spawn(self.api_clients_queue,
                                              self.resource_items_queue,
-                                             self.db, self.workers_config,
+                                             self.db, self.dbs, self.workers_config,
                                              self.retry_resource_items_queue,
                                              self.api_clients_info)
                 self.workers_pool.add(w)
@@ -429,7 +460,7 @@ class EdgeDataBridge(object):
                 self.create_api_client()
                 w = ResourceItemWorker.spawn(self.api_clients_queue,
                                              self.retry_resource_items_queue,
-                                             self.db, self.workers_config,
+                                             self.db, self.dbs, self.workers_config,
                                              self.retry_resource_items_queue,
                                              self.api_clients_info)
                 self.retry_workers_pool.add(w)
@@ -475,38 +506,41 @@ class EdgeDataBridge(object):
                     extra={'MESSAGE_ID': 'marked_as_bad'})
 
     def perfomance_watcher(self):
-            avg_duration, values = self._get_average_requests_duration()
-            for _, info in self.api_clients_info.items():
-                delta = timedelta(
-                    seconds=self.perfomance_window + self.watch_interval)
-                current_date = datetime.now() - delta
-                delete_list = []
-                for key in info['request_durations']:
-                    if key < current_date:
-                        delete_list.append(key)
-                for k in delete_list:
-                    del info['request_durations'][k]
-                delete_list = []
+        avg_duration, values = self._get_average_requests_duration()
+        for _, info in self.api_clients_info.items():
+            delta = timedelta(
+                seconds=self.perfomance_window + self.watch_interval)
+            current_date = datetime.now() - delta
+            delete_list = []
+            for key in info['request_durations']:
+                if key < current_date:
+                    delete_list.append(key)
+            for k in delete_list:
+                del info['request_durations'][k]
+            delete_list = []
 
-            st_dev = self._calculate_st_dev(values)
-            if len(values) > 0:
-                min_avg = min(values) * 1000
-                max_avg = max(values) * 1000
-            else:
-                max_avg = 0
-                min_avg = 0
-            dev = round(st_dev + avg_duration, 3)
+        st_dev = self._calculate_st_dev(values)
+        if len(values) > 0:
+            min_avg = min(values) * 1000
+            max_avg = max(values) * 1000
+        else:
+            max_avg = 0
+            min_avg = 0
+        dev = round(st_dev + avg_duration, 3)
 
-            logger.info(
-                'Perfomance watcher:\nREQUESTS_STDEV - {} sec.\n'
-                'REQUESTS_DEV - {} ms.\nREQUESTS_MIN_AVG - {} ms.\n'
-                'REQUESTS_MAX_AVG - {} ms.\nREQUESTS_AVG - {} sec.'.format(
-                    round(st_dev, 3), dev, min_avg, max_avg, avg_duration),
-                extra={'REQUESTS_DEV': dev * 1000,
-                       'REQUESTS_MIN_AVG': min_avg,
-                       'REQUESTS_MAX_AVG': max_avg,
-                       'REQUESTS_AVG': avg_duration * 1000})
-            self._mark_bad_clients(dev)
+        logger.info(
+            'Perfomance watcher:\n'
+            '\tREQUESTS_STDEV   - {} sec.\n'
+            '\tREQUESTS_DEV     - {} ms.\n'
+            '\tREQUESTS_MIN_AVG - {} ms.\n'
+            '\tREQUESTS_MAX_AVG - {} ms.\n'
+            '\tREQUESTS_AVG     - {} sec.'.format(
+                round(st_dev, 3), dev, min_avg, max_avg, avg_duration),
+            extra={'REQUESTS_DEV': dev * 1000,
+                   'REQUESTS_MIN_AVG': min_avg,
+                   'REQUESTS_MAX_AVG': max_avg,
+                   'REQUESTS_AVG': avg_duration * 1000})
+        self._mark_bad_clients(dev)
 
     def run(self):
         logger.info('Start Edge Bridge',
@@ -516,6 +550,12 @@ class EdgeDataBridge(object):
         self.input_queue_filler = spawn(self.fill_input_queue)
         self.filler = spawn(self.fill_resource_items_queue)
         spawn(self.queues_controller)
+        if self.archive and self.dbs:
+            # start sync main and archives worker
+            ResourceItemWorker.spawn(
+                None, None,
+                self.db, self.dbs, self.workers_config,
+                self.retry_resource_items_queue)
         while True:
             self.gevent_watcher()
             sleep(self.watch_interval)
@@ -528,7 +568,7 @@ def main():
     if os.path.isfile(params.config):
         with open(params.config) as config_file_obj:
             config = load(config_file_obj.read())
-        logging.config.dictConfig(config)
+        logging.config.dictConfig(config['logging'])
         EdgeDataBridge(config).run()
 
 

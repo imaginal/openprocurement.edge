@@ -12,6 +12,8 @@ from gevent import spawn, sleep
 from gevent.queue import Empty
 from iso8601 import parse_date
 from pytz import timezone
+from couchdb import http
+from openprocurement.edge.utils import make_patch
 from requests.exceptions import ConnectionError
 from openprocurement_client.exceptions import (
     InvalidResponse,
@@ -28,13 +30,20 @@ TZ = timezone(os.environ['TZ'] if 'TZ' in os.environ else 'Europe/Kiev')
 class ResourceItemWorker(Greenlet):
 
     def __init__(self, api_clients_queue=None, resource_items_queue=None,
-                 db=None, config_dict=None, retry_resource_items_queue=None,
+                 db=None, dbs=None, config_dict=None, retry_resource_items_queue=None,
                  api_clients_info=None):
         Greenlet.__init__(self)
         self.exit = False
         self.update_doc = False
         self.db = db
+        self.dbs = dbs
         self.config = config_dict
+        self.archive = len(dbs)
+        self.archive_status = self.config['archive_status']
+        if self.archive_status and ',' in self.archive_status:
+            self.archive_status = self.archive_status.strip().split(',')
+        self.delete_from_archive = self.config.get('delete_from_archive')
+        self.exists_in_archive = {}
         self.api_clients_queue = api_clients_queue
         self.resource_items_queue = resource_items_queue
         self.retry_resource_items_queue = retry_resource_items_queue
@@ -242,7 +251,20 @@ class ResourceItemWorker(Greenlet):
         public_resource_item['doc_type'] = self.config['resource'][:-1].title()
         public_resource_item['_id'] = public_resource_item['id']
         if local_resource_item:
+            if local_resource_item['dateModified'] >= public_resource_item['dateModified']:
+                logger.debug('Ignored dublicate {} {} existing {}, current '
+                    '{}'.format(
+                        self.config['resource'][:-1], public_resource_item['id'],
+                        local_resource_item['dateModified'],
+                        public_resource_item['dateModified']),
+                    extra={'MESSAGE_ID': 'skipped'})
+                return
             public_resource_item['_rev'] = local_resource_item['_rev']
+            changes = local_resource_item.pop('changes', [])
+            patch = make_patch(public_resource_item, local_resource_item)
+            if patch and patch.patch:
+                changes.insert(0, patch.patch)
+            public_resource_item['changes'] = changes
         bulk_doc = self.bulk.get(public_resource_item['id'])
 
         if bulk_doc and bulk_doc['dateModified'] < \
@@ -275,10 +297,300 @@ class ResourceItemWorker(Greenlet):
                 ),
                 extra={'MESSAGE_ID': 'add_to_save_bulk'})
 
+    def sync_archive_dbs(self):
+        for year in self.dbs:
+            if self._check_sync_needed(year):
+                self._sync_archive_and_main(year)
+
+    def _check_sync_needed(self, year, limit=50):
+        logger.info('Check sync of archive {} and main {}'
+            .format(year, self.config['resource']),
+            extra={'MESSAGE_ID': 'check_sync_archive'})
+        db = self.dbs[year]
+        main_db = self.db
+        view_path = '_all_docs'
+        for doc in db.view(view_path, limit=limit):
+            if doc['id'][:1] == '_':
+                continue
+            if not main_db.get(doc['id']):
+                return True
+        for doc in db.view(view_path, limit=limit, descending=True):
+            if doc['id'][:1] == '_':
+                continue
+            if not main_db.get(doc['id']):
+                return True
+        return False
+
+    def _sync_archive_and_main(self, year):
+        logger.info('Start sync from archive {} to main {}'
+            .format(year, self.config['resource']),
+            extra={'MESSAGE_ID': 'start_sync_archive'})
+        db = self.dbs[year]
+        main_db = self.db
+        view_path = '_design/{}/_view/by_dateModified'.format(
+            self.config['resource'])
+        self.exit = False
+        self.archive = False
+        stub_created = 0
+        for row in db.view(view_path):
+            doc_id = row['id']
+            doc = db.get(doc_id)
+            stub = main_db.get(doc_id)
+            if stub and stub['dateModified'] == doc['dateModified']:
+                continue
+            logger.debug('Add stub from archive {} to main {} {}'
+                .format(year, self.config['resource'][:-1], doc_id),
+                extra={'MESSAGE_ID': 'add_stub_from_archive'})
+            newstub = self._get_archive_stub(doc, year)
+            if stub and '_rev' in stub:
+                newstub['_rev'] = stub['_rev']
+            self.bulk[doc_id] = newstub
+            self.priority_cache[doc_id] = 1
+            self._save_bulk_docs()
+            stub_created += 1
+        if self.bulk:
+            self.exit = True
+            self._save_bulk_docs()
+            assert not self.bulk
+        logger.info('End sync archive {}, created {} {} stubs'
+            .format(year, stub_created, self.config['resource']),
+            extra={'MESSAGE_ID': 'end_sync_archive'})
+
+    def _run_sync_worker(self):
+        logger.info('Start sync from {} main to archive worker...'
+            .format(self.config['resource']),
+            extra={'MESSAGE_ID': 'start_sync_worker'})
+        self.sync_archive_priority = 1
+        main_db = self.db
+        view_path = '_design/{}/_view/by_dateModified'.format(
+            self.config['resource'])
+        bulk_archive = {k: {} for k in self.dbs}
+        total_count = 0
+        archive_count = 0
+        for row in main_db.view(view_path, descending=True):
+            if self.exit:
+                break
+            doc_id = row['id']
+            doc = row['value']
+            if 'archived' in doc:  # is archive stub
+                year = self._get_archive_year(doc)
+                if year not in self.dbs:
+                    logger.error('No archive for {} {} {}'
+                        .format(year, self.config['resource'][:-1], doc_id),
+                        extra={'MESSAGE_ID': 'archive_not_found'})
+                    continue
+                bulk_archive[year][doc_id] = row['key']
+                self._check_archive_bulk(bulk_archive, year)
+                archive_count += 1
+            # some statistics
+            total_count += 1
+            if total_count % self.config['sync_worker_stat'] == 0:
+                logger.info('Sync {} worker: {:,} processed {:,} in archive'
+                    .format(self.config['resource'], total_count, archive_count),
+                    extra={'MESSAGE_ID': 'sync_worker_timer'})
+                sleep(self.config['sync_worker_sleep'])
+        # flush
+        for year in self.dbs:
+            self._check_archive_bulk(bulk_archive, year, 0)
+        logger.info('End sync {} worker: {:,} processed {:,} in archive'
+            .format(self.config['resource'], total_count, archive_count),
+            extra={'MESSAGE_ID': 'end_sync_worker'})
+
+    def _check_archive_bulk(self, bulk_archive, year, limit=100):
+        if not bulk_archive[year] or len(bulk_archive[year]) < limit:
+            return
+        logger.info('Check {} archive {} with {} items'
+            .format(self.config['resource'][:-1], year, len(bulk_archive[year])),
+            extra={'MESSAGE_ID': 'check_archive'})
+        archive_db = self.dbs[year]
+        view_path = '_design/{}/_view/by_dateModified'.format(
+            self.config['resource'])
+        bulk_values = bulk_archive[year].values()
+        resp_dict = {}
+        for n in range(5):
+            try:
+                start = time.time()
+                rows = archive_db.view(view_path, keys=bulk_values)
+                end = time.time() - start
+                resp_dict = {k.id: k.key for k in rows}
+                logger.debug('Check in {} archive {} duration: {} sec, {} found'
+                    .format(self.config['resource'][:-1], year, end, len(resp_dict)),
+                    extra={'CHECK_IN_ARCHIVE': end})
+                break
+            except Exception as e:
+                logger.error('Error while bulk check {} items in {} archive {} error {}'
+                    .format(len(bulk_values), self.config['resource'], year, e.message),
+                    extra={'MESSAGE_ID': 'exceptions'})
+                if n > 3:
+                    raise
+                sleep(1 + 2 * n)
+        # process results of view
+        for doc_id, date_modified in bulk_archive[year].items():
+            if doc_id in resp_dict and resp_dict[doc_id] == date_modified:
+                continue
+            doc = self.db.get(doc_id)
+            archive_doc = archive_db.get(doc_id)
+            # double check before possible delete
+            if doc and archive_doc and doc.get('dateModified') and \
+                    doc['dateModified'] == archive_doc['dateModified']:
+                continue
+            if doc and doc.get('archived'):  # is archive stub
+                logger.warning('Delete {} stub {} from main (missed in archive {})'
+                    .format(self.config['resource'][:-1], doc_id, year),
+                    extra={'MESSAGE_ID': 'delete_from_main'})
+                self.db.delete(doc)
+            if self.delete_from_archive and archive_doc:
+                logger.warning('Delete {} {} from arhicve {} (missed stub in main)'
+                    .format(self.config['resource'][:-1], doc_id, year),
+                    extra={'MESSAGE_ID': 'delete_from_archive'})
+                archive_db.delete(archive_doc)
+            elif archive_doc:
+                self.exists_in_archive[doc_id] = True
+            self.add_to_retry_queue(doc_id, self.sync_archive_priority)
+        # clear bulk
+        bulk_archive[year] = {}
+
+    def _is_archive_doc(self, doc):
+        if doc.get('status') in self.archive_status:
+            return True
+        return False
+
+    def _get_archive_year(self, doc):
+        if 'archived' in doc:
+            return doc['archived']
+        keyid = self.config['resource'][:-1] + 'ID'
+        parts = doc.get(keyid, '').split('-')
+        if len(parts) < 5:
+            return None
+        for i in range(1, 5):
+            if len(parts[i]) == 4 and parts[i][:2] == '20':
+                return parts[i]
+
+    def _get_archive_stub(self, doc, year=None):
+        keyid = self.config['resource'][:-1] + 'ID'
+        fields = ['_id', 'id', 'doc_type', 'status', 'dateModified', keyid]
+        if not year:
+            year = self._get_archive_year(doc)
+        stub = {'archived': year}
+        for k in fields:
+            if k in doc:
+                stub[k] = doc[k]
+        return stub
+
+    def _get_archive_doc(self, year, doc_id):
+        for n in range(5):
+            try:
+                return self.dbs[year].get(doc_id)
+            except Exception as e:
+                logger.error('Can\'t get doc {} from {} arhicve {}: {} {}'
+                    .format(doc_id, self.config['resource'], year,
+                        type(e), e.message))
+                if n > 3:
+                    raise
+                sleep(1 + 2 * n)
+
+    def _save_bulk_archive(self):
+        bulk_archive = {}
+        stub_archive = {}
+        # fill archive queues
+        for doc_id, doc in self.bulk.items():
+            if self._is_archive_doc(doc):
+                year = self._get_archive_year(doc)
+                if year not in self.dbs:
+                    logger.error('No archive {} for {} {}'.format(
+                        year, self.config['resource'][:-1], doc_id))
+                    continue
+                if year not in bulk_archive:
+                    bulk_archive[year] = {}
+                archive_doc = None
+                doc_rev = doc.pop('_rev', None)
+                stub = self._get_archive_stub(doc, year)
+                if doc_rev:
+                    stub['_rev'] = doc_rev
+                    archive_doc = self._get_archive_doc(year, doc_id)
+                elif self.exists_in_archive.get(doc_id):
+                    self.exists_in_archive.pop(doc_id)
+                    archive_doc = self._get_archive_doc(year, doc_id)
+                elif self.priority_cache[doc_id] > 1:
+                    archive_doc = self._get_archive_doc(year, doc_id)
+                if archive_doc:
+                    doc['_rev'] = archive_doc['_rev']
+                    changes = archive_doc.pop('changes', [])
+                    patch = make_patch(doc, archive_doc)
+                    if patch and patch.patch:
+                        changes.insert(0, patch.patch)
+                    doc['changes'] = changes
+                    logger.warning('Update archive {} {} {} rev {}'.format(
+                        year, self.config['resource'][:-1], doc_id, doc['_rev']))
+                bulk_archive[year][doc_id] = doc
+                stub_archive[doc_id] = stub
+        # flush archive queues
+        for year, bulk_items in bulk_archive.items():
+            logger.debug('Try flush {} archive {} with {} items'
+                .format(self.config['resource'], year, len(bulk_items)))
+            try:
+                db = self.dbs[year]
+                start = time.time()
+                res = db.update(bulk_items.values())
+                end = time.time() - start
+                logger.debug('Bulk save archive {} duration: {} sec.'.format(year, end),
+                             extra={'SAVE_BULK_DURATION': end})
+            except Exception as e:
+                logger.error('Error while saving bulk {} {} in db: {} {}'
+                    .format(self.config['resource'], year, type(e), e.message),
+                    extra={'MESSAGE_ID': 'exceptions'})
+                continue
+            for success, doc_id, rev_or_exc in res:
+                if success:
+                    if rev_or_exc.startswith('1-'):
+                        logger.info('Save {} {} to archive {}'.format(
+                            self.config['resource'][:-1], doc_id, year),
+                            extra={'MESSAGE_ID': 'save_archive_documents'})
+                    else:
+                        logger.info('Update {} {} in archive {}'.format(
+                            self.config['resource'][:-1], doc_id, year),
+                            extra={'MESSAGE_ID': 'update_archive_documents'})
+                    # now add stub in bulk
+                    logger.debug('Add stub for {} {} archive {}'
+                        .format(self.config['resource'][:-1], doc_id, year),
+                        extra={'MESSAGE_ID': 'add_stub'})
+                    self.bulk[doc_id] = stub_archive[doc_id]
+                else:
+                    if rev_or_exc.message in (u'Document update conflict.',
+                                              u'New doc with oldest dateModified.'):
+                        try:
+                            db_doc = db.get(doc_id)
+                            bulk_doc = bulk_items[doc_id]
+                            if db_doc and db_doc['dateModified'] == bulk_doc['dateModified']:
+                                logger.info('Add stub for existing {}'.format(doc_id),
+                                    extra={'MESSAGE_ID': 'add_stub_for_existing'})
+                                self.bulk[doc_id] = stub_archive[doc_id]
+                                continue
+                        except Exception as e:
+                            logger.error('Error when checking {} {} in archive {} reason '
+                                '{} {} {}'.format(self.config['resource'][:-1], doc_id, year,
+                                    rev_or_exc.message, type(e), e.message),
+                                extra={'MESSAGE_ID': 'exception'})
+                        # update exists cache
+                        self.exists_in_archive[doc_id] = True
+                    # remove from current bulk and add to retry queue
+                    self.bulk.pop(doc_id)
+                    self.add_to_retry_queue(
+                        doc_id, priority=self.priority_cache[doc_id]
+                    )
+                    logger.error(
+                        'Put to retry queue {} {} archive {} with reason: '
+                        '{}'.format(self.config['resource'][:-1],
+                                    doc_id, year, rev_or_exc.message))
+
     def _save_bulk_docs(self):
         if (len(self.bulk) > self.bulk_save_limit or
                 (datetime.now() - self.start_time).total_seconds() >
                 self.bulk_save_interval or self.exit):
+            if self.archive and self.api_clients_queue:
+                self._save_bulk_archive()
+            if len(self.bulk) == 0:
+                return
             try:
                 logger.debug('Try save bulk: {}'.format(len(self.bulk)),
                              extra={'SAVE_BULK_LEN': len(self.bulk)})
@@ -318,25 +630,35 @@ class ResourceItemWorker(Greenlet):
                             extra={'MESSAGE_ID': 'save_documents'})
                     continue
                 else:
-                    if rev_or_exc.message !=\
-                            u'New doc with oldest dateModified.':
-                        self.add_to_retry_queue(
-                            doc_id, priority=self.priority_cache[doc_id]
-                        )
-                        logger.error(
-                            'Put to retry queue {} {} with reason: '
-                            '{}'.format(self.config['resource'][:-1],
-                                        doc_id, rev_or_exc.message))
-                    else:
-                        logger.debug('Ignored {} {} with reason: {}'.format(
-                            self.config['resource'][:-1], doc_id, rev_or_exc),
-                            extra={'MESSAGE_ID': 'skiped'})
-                        continue
+                    if rev_or_exc.message in (u'Document update conflict.',
+                                              u'New doc with oldest dateModified.'):
+                        try:
+                            db_doc = self.db.get(doc_id)
+                            bulk_doc = self.bulk[doc_id]
+                            if db_doc and db_doc['dateModified'] == bulk_doc['dateModified']:
+                                logger.debug('Ignored {} {} with reason: {}'.format(
+                                    self.config['resource'][:-1], doc_id, rev_or_exc),
+                                    extra={'MESSAGE_ID': 'skiped'})
+                                continue
+                        except Exception as e:
+                            logger.error('Error when checking {} {} reason {} exception {}'.format(
+                                self.config['resource'][:-1], doc_id, rev_or_exc.message, e),
+                                extra={'MESSAGE_ID': 'exception'})
+                    self.add_to_retry_queue(
+                        doc_id, priority=self.priority_cache[doc_id]
+                    )
+                    logger.error(
+                        'Put to retry queue {} {} with reason: '
+                        '{}'.format(self.config['resource'][:-1],
+                                    doc_id, rev_or_exc.message))
             self.bulk = {}
             self.priority_cache = {}
             self.start_time = datetime.now()
 
     def _run(self):
+        if self.api_clients_queue is None and self.dbs:
+            return self._run_sync_worker()
+
         while not self.exit:
             # Try get api client from clients queue
             api_client_dict = self._get_api_client_dict()

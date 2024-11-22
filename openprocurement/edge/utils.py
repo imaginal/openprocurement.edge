@@ -5,23 +5,35 @@ from cornice.resource import resource, view
 from cornice.util import json_error
 from couchapp.dispatch import dispatch
 from couchdb import Server, Session
+from couchdb.http import Cache
 from datetime import datetime
 from socket import error
 from Crypto.Cipher import AES
 from functools import partial
+from pyramid.exceptions import URLDecodeError
+from pyramid.compat import decode_path_info
+from munch import munchify
 from json import dumps
+from jsonpatch import JsonPatch
+from jsonpointer import JsonPointer
 from logging import getLogger
 from pkg_resources import get_distribution
 from pytz import timezone
 from webob.multidict import NestedMultiDict
-from openprocurement.edge.traversal import resource_factory
+from openprocurement.edge.traversal import (
+    tender_factory,
+    auction_factory,
+    contract_factory,
+    plan_factory
+)
 
 PKG = get_distribution(__package__)
 LOGGER = getLogger(PKG.project_name)
 
 TZ = timezone(os.environ['TZ'] if 'TZ' in os.environ else 'Europe/Kiev')
-VERSION = '2.3'
+VERSION = '2.5'
 ROUTE_PREFIX = '/api/{}'.format(VERSION)
+HUMAN_ID_PREFIX = 'UA-'
 SERVICE_FIELDS = ('__parent__', '_rev', '_id', 'doc_type')
 json_view = partial(view, renderer='json')
 
@@ -47,7 +59,13 @@ class APIResource(object):
         self.LOGGER = getLogger(type(self).__module__)
 
 
-def prepare_couchdb(couch_url, db_name, logger):
+class DummyCache(Cache):
+    def put(self, url, response):
+        pass
+
+
+def prepare_couchdb(couch_url, db_name, logger, disable_cache=True):
+    logger.info('Open database {}'.format(db_name))
     server = Server(couch_url, session=Session(retry_delays=range(10)))
     try:
         if db_name not in server:
@@ -57,6 +75,10 @@ def prepare_couchdb(couch_url, db_name, logger):
     except error as e:
         logger.error('Database error: {}'.format(repr(e)))
         raise DataBridgeConfigError(e.strerror)
+
+    # disable http cache for get queries
+    if disable_cache:
+        db.resource.session.cache = DummyCache()
 
     validate_doc = db.get(VALIDATE_BULK_DOCS_ID, {'_id': VALIDATE_BULK_DOCS_ID})
     if validate_doc.get('validate_doc_update') != VALIDATE_BULK_DOCS_UPDATE:
@@ -73,6 +95,14 @@ def prepare_couchdb_views(db_url, resource, logger):
         + '/couch_views' + '/' + resource
     push_views(couchapp_path=couchapp_path, couch_url=db_url)
     logger.info('Show views for {} installed.'.format(resource))
+
+
+def make_patch(src, dst):
+    def obj_dumps(obj, **kw):
+        if type(obj) == float and int(obj) == obj:
+            obj = int(obj)
+        return dumps(obj, **kw)
+    return JsonPatch.from_diff(src, dst, dumps=obj_dumps, pointer_cls=JsonPointer)
 
 
 def get_now():
@@ -145,13 +175,84 @@ def error_handler(errors, request_params=True):
 
 
 opresource = partial(resource, error_handler=error_handler,
-                     factory=resource_factory)
+                     factory=tender_factory)
 eaopresource = partial(resource, error_handler=error_handler,
-                       factory=resource_factory)
+                       factory=auction_factory)
 contractingresource = partial(resource, error_handler=error_handler,
-                              factory=resource_factory)
+                              factory=contract_factory)
 planningresource = partial(resource, error_handler=error_handler,
-                           factory=resource_factory)
+                           factory=plan_factory)
+
+
+def extract_doc_adapter(request, doc_id, doc_type):
+    db = request.registry.db
+    doc = {}
+    if doc_id.startswith(HUMAN_ID_PREFIX):
+        view_path = '_design/{}s/_view/all'.format(doc_type.lower())
+        for row in db.view(view_path, keys=[doc_id], limit=1):
+            doc_id = row['id']
+            doc = row['value']
+    if not doc.get('archived'):
+        doc = db.get(doc_id)
+    if doc and 'archived' in doc and doc['archived'] in request.registry.dbs:
+        year = doc['archived']
+        db = request.registry.dbs[year]
+        doc = db.get(doc_id)
+    if doc is None or doc.get('doc_type') != doc_type or doc.get('archived'):
+        request.errors.add('url', '{}_id'.format(doc_type.lower()), 'Not Found')
+        request.errors.status = 404
+        raise error_handler(request.errors)
+    return munchify(doc)
+
+
+def extract_doc(request, doc_type):
+    try:
+        # empty if mounted under a path in mod_wsgi, for example
+        path = decode_path_info(request.environ['PATH_INFO'] or '/')
+    except KeyError:
+        path = '/'
+    except UnicodeDecodeError as e:
+        raise URLDecodeError(e.encoding, e.object, e.start, e.end, e.reason)
+
+    doc_id = ""
+    # extract doc id
+    parts = path.split('/')
+    if len(parts) < 4 or parts[3] != '{}s'.format(doc_type.lower()):
+        return
+
+    doc_id = parts[4]
+    return extract_doc_adapter(request, doc_id, doc_type)
+
+
+def extract_tender(request):
+    return extract_doc(request, 'Tender')
+
+
+def extract_auction(request):
+    return extract_doc(request, 'Auction')
+
+
+def extract_contract(request):
+    return extract_doc(request, 'Contract')
+
+
+def extract_plan(request):
+    return extract_doc(request, 'Plan')
+
+
+EXTRACT_METHODS = {
+    'tenders': extract_tender,
+    'auctions': extract_auction,
+    'contracts': extract_contract,
+    'plans': extract_plan,
+}
+
+
+def clean_up_doc(doc, service_fields=SERVICE_FIELDS):
+    for field in service_fields:
+        if field in doc:
+            del doc[field]
+    return doc
 
 
 def push_views(couchapp_path=None, couch_url=None):
@@ -172,7 +273,7 @@ def request_params(request):
         request.errors.add('body', 'data', 'could not decode params')
         request.errors.status = 422
         raise error_handler(request.errors, False)
-    except Exception, e:
+    except Exception as e:
         request.errors.add('body', str(e.__class__.__name__), str(e))
         request.errors.status = 422
         raise error_handler(request.errors, False)
@@ -238,6 +339,6 @@ def decrypt(uuid, name, key):
     iv = "{:^{}.{}}".format(name, AES.block_size, AES.block_size)
     try:
         text = AES.new(uuid, AES.MODE_CBC, iv).decrypt(unhexlify(key)).strip()
-    except:
+    except Exception:
         text = ''
     return text
