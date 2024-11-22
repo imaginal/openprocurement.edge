@@ -15,6 +15,7 @@ requires = [
     'couchapp',
     'pycrypto',
     'openprocurement_client',
+    'jsonpatch',
     'munch',
     'tzlocal',
     'pyyaml',
