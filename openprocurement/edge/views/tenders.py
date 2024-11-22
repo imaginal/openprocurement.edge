@@ -2,6 +2,7 @@
 from functools import partial
 from openprocurement.edge.utils import (
     APIResource,
+    clean_up_doc,
     decrypt,
     encrypt,
     json_view,
@@ -18,7 +19,8 @@ from openprocurement.edge.design import (
 from openprocurement.edge.design import TENDER_FIELDS as FIELDS
 
 VIEW_MAP = {
-    u'': real_by_dateModified_view_ViewDefinition('tenders'),
+    u'': by_dateModified_view_ViewDefinition('tenders'),
+    u'real': real_by_dateModified_view_ViewDefinition('tenders'),
     u'test': test_by_dateModified_view_ViewDefinition('tenders'),
     u'_all_': by_dateModified_view_ViewDefinition('tenders'),
 }
@@ -29,7 +31,7 @@ CHANGES_VIEW_MAP = {
 }
 FEED = {
     u'dateModified': VIEW_MAP,
-    u'changes': CHANGES_VIEW_MAP,
+#    u'changes': CHANGES_VIEW_MAP,
 }
 
 
@@ -182,3 +184,14 @@ class TendersResource(APIResource):
                 "uri": self.request.route_url('Tenders', _query=pparams)
             }
         return data
+
+
+@opresource(name='Tender',
+            path='/tenders/{tender_id}',
+            description="Open Contracting compatible data exchange format. See http://ocds.open-contracting.org/standard/r/master/#tender for more info")
+class TenderResource(APIResource):
+
+    @json_view()
+    def get(self):
+        tender = clean_up_doc(self.request.validated['tender'])
+        return {'data': tender}

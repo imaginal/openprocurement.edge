@@ -5,6 +5,8 @@ if 'test' not in __import__('sys').argv[0]:
 from couchdb import Server as CouchdbServer, Session
 from logging import getLogger
 from openprocurement.edge.utils import (
+    VERSION,
+    EXTRACT_METHODS,
     add_logging_context,
     set_logging_context,
     prepare_couchdb,
@@ -52,8 +54,23 @@ class Server(CouchdbServer):
         return self._uuid
 
 
+def open_archive_dbs(config, settings):
+    archive = settings.get('archive').strip()
+    db_name = settings.get('couchdb.db_name')
+    if '-' in archive:
+        afrom, ato = map(int, archive.split('-'))
+        archive = map(str, range(afrom, ato + 1))
+    elif ',' in archive:
+        archive = archive.split(',')
+    for year in archive:
+        config.registry.dbs[year] = prepare_couchdb(
+            settings.get('couchdb.url'),
+            '{}_{}'.format(db_name, year),
+            LOGGER)
+
+
 def main(global_config, **settings):
-    version = settings.get('api_version')
+    version = settings.get('api_version', VERSION)
     route_prefix = '/api/{}'.format(version)
     config = Configurator(
         autocommit=True,
@@ -73,10 +90,17 @@ def main(global_config, **settings):
     config.scan("openprocurement.edge.views.spore")
     config.scan("openprocurement.edge.views.health")
 
+    db_name = settings.get('couchdb.db_name')
+    config.registry.dbs = {}
+    if settings.get('archive'):
+        open_archive_dbs(config, settings)
+        db_name += '_main'
+
     resources = settings.get('resources') and settings['resources'].split(',')
-    couch_url = settings.get('couchdb.url') + settings.get('couchdb.db_name')
+    couch_url = settings.get('couchdb.url') + db_name
     for resource in resources:
         config.scan("openprocurement.edge.views." + resource)
+        config.add_request_method(EXTRACT_METHODS[resource], resource[:-1], reify=True)
         prepare_couchdb_views(couch_url, resource, LOGGER)
         LOGGER.info('Push couch {} views successful.'.format(resource))
         LOGGER.info('{} resource initialized successful.'.format(resource.title()))
@@ -86,7 +110,7 @@ def main(global_config, **settings):
                     session=Session(retry_delays=range(10)))
     config.registry.couchdb_server = server
     config.registry.db = prepare_couchdb(settings.get('couchdb.url'),
-                                         settings.get('couchdb.db_name'),
+                                         db_name,
                                          LOGGER)
     config.registry.server_id = settings.get('id', '')
     config.registry.health_threshold = float(settings.get('health_threshold', 99))
