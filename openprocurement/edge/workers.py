@@ -418,8 +418,9 @@ class ResourceItemWorker(Greenlet):
                     extra={'CHECK_IN_ARCHIVE': end})
                 break
             except Exception as e:
-                logger.error('Error while bulk check {} items in {} archive {} error {}'
-                    .format(len(bulk_values), self.config['resource'], year, e.message),
+                logger.error('Error while bulk check (try {}) {} items '
+                    'in {} archive {} error {}'.format(n + 1, len(bulk_values),
+                        self.config['resource'], year, e.message),
                     extra={'MESSAGE_ID': 'exceptions'})
                 if n > 3:
                     raise
@@ -482,9 +483,9 @@ class ResourceItemWorker(Greenlet):
             try:
                 return self.dbs[year].get(doc_id)
             except Exception as e:
-                logger.error('Can\'t get doc {} from {} arhicve {}: {} {}'
-                    .format(doc_id, self.config['resource'], year,
-                        type(e), e.message))
+                logger.error('Error while get doc {} from {} arhicve {}: {} {} '
+                    '(try {})'.format(doc_id, self.config['resource'], year,
+                        type(e).__name__, e.message, n + 1))
                 if n > 3:
                     raise
                 sleep(1 + 2 * n)
@@ -537,7 +538,7 @@ class ResourceItemWorker(Greenlet):
                              extra={'SAVE_BULK_DURATION': end})
             except Exception as e:
                 logger.error('Error while saving bulk {} {} in db: {} {}'
-                    .format(self.config['resource'], year, type(e), e.message),
+                    .format(self.config['resource'], year, type(e).__name__, e.message),
                     extra={'MESSAGE_ID': 'exceptions'})
                 continue
             for success, doc_id, rev_or_exc in res:
@@ -569,7 +570,7 @@ class ResourceItemWorker(Greenlet):
                         except Exception as e:
                             logger.error('Error when checking {} {} in archive {} reason '
                                 '{} {} {}'.format(self.config['resource'][:-1], doc_id, year,
-                                    rev_or_exc.message, type(e), e.message),
+                                    rev_or_exc.message, type(e).__name__, e.message),
                                 extra={'MESSAGE_ID': 'exception'})
                         # update exists cache
                         self.exists_in_archive[doc_id] = True

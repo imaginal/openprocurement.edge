@@ -270,7 +270,8 @@ class EdgeDataBridge(object):
                 resp_dict = {k.id: k.key for k in rows}
                 break
             except (IncompleteRead, Exception) as e:
-                logger.error('Error while send bulk {}'.format(e.message),
+                logger.error('Error while check bulk (try {}): {} {}'.format(
+                             i + 1, type(e).__name__, e.message),
                              extra={'MESSAGE_ID': 'exceptions'})
                 if i == 2:
                     raise e
