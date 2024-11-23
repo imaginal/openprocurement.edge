@@ -302,7 +302,7 @@ class ResourceItemWorker(Greenlet):
             .format(self.config['resource']),
             extra={'MESSAGE_ID': 'start_sync_archive'})
         try:
-            for year in self.dbs:
+            for year in sorted(self.dbs.keys()):
                 if self._check_sync_needed(year):
                     logger.warning('Need sync archive {} and main db'.format(year))
                     self._sync_main_from_archive(year)
@@ -315,20 +315,20 @@ class ResourceItemWorker(Greenlet):
             extra={'MESSAGE_ID': 'end_sync_archive'})
 
     def _check_sync_needed(self, year, limit=50):
-        logger.info('Checking that {} archive {} is synced with main db...'
+        logger.info('Check {} archive {} for sync with main db...'
             .format(self.config['resource'], year),
             extra={'MESSAGE_ID': 'check_sync_archive'})
-        db = self.dbs[year]
         main_db = self.db
+        archive_db = self.dbs[year]
         view_path = '_all_docs'
-        for doc in db.view(view_path, limit=limit):
+        for doc in archive_db.view(view_path, limit=limit):
             if doc['id'][:1] == '_':
                 continue
             if not main_db.get(doc['id']):
                 logger.error('Stub {} {} from archive {} not found in main db'
                     .format(self.config['resource'][:-1], doc['id'], year))
                 return True
-        for doc in db.view(view_path, limit=limit, descending=True):
+        for doc in archive_db.view(view_path, limit=limit, descending=True):
             if doc['id'][:1] == '_':
                 continue
             if not main_db.get(doc['id']):
@@ -341,8 +341,8 @@ class ResourceItemWorker(Greenlet):
         logger.info('Start sync {} from archive {} to main db...'
             .format(self.config['resource'], year),
             extra={'MESSAGE_ID': 'start_sync_archive'})
-        db = self.dbs[year]
         main_db = self.db
+        archive_db = self.dbs[year]
         view_path = '_design/{}/_view/by_dateModified'.format(
             self.config['resource'])
         self.archive = False
@@ -350,7 +350,7 @@ class ResourceItemWorker(Greenlet):
         stub_skipped = 0
         count_rows = 0
         stat_time = time.time()
-        view_results = db.view(view_path)
+        view_results = archive_db.view(view_path)
         for row in view_results:
             count_rows += 1
             # print some statistics
@@ -363,15 +363,16 @@ class ResourceItemWorker(Greenlet):
                 stat_time = time.time()
             # process rows
             doc_id = row['id']
-            doc = db.get(doc_id)
             stub = main_db.get(doc_id)
-            if stub and stub['dateModified'] == doc['dateModified']:
+            archive_doc_date_modified = row['key']
+            if stub and stub['dateModified'] == archive_doc_date_modified:
                 stub_skipped += 1
                 continue
             logger.debug('Add stub from archive {} to main {} {}'
                 .format(year, self.config['resource'][:-1], doc_id),
                 extra={'MESSAGE_ID': 'add_stub_from_archive'})
-            newstub = self._get_archive_stub(doc, year)
+            archive_doc = self._get_archive_doc(year, doc_id)
+            newstub = self._get_archive_stub(archive_doc, year)
             if stub and '_rev' in stub:
                 newstub['_rev'] = stub['_rev']
             # add new stub to bulk
@@ -442,7 +443,7 @@ class ResourceItemWorker(Greenlet):
                 self._check_archive_bulk(bulk_archive, year)
                 archive_count += 1
         # flush
-        for year in self.dbs:
+        for year in sorted(self.dbs.keys()):
             self._check_archive_bulk(bulk_archive, year, 0)
         logger.info('End sync {} worker: {:,} processed {:,} in archive'
             .format(self.config['resource'], rows_count, archive_count),
@@ -482,7 +483,7 @@ class ResourceItemWorker(Greenlet):
             if doc_id in resp_dict and resp_dict[doc_id] == date_modified:
                 continue
             doc = self.db.get(doc_id)
-            archive_doc = archive_db.get(doc_id)
+            archive_doc = self._get_archive_doc(year, doc_id)
             # double check before possible delete
             if doc and archive_doc and doc.get('dateModified') and \
                     doc['dateModified'] == archive_doc['dateModified']:
@@ -596,9 +597,9 @@ class ResourceItemWorker(Greenlet):
             logger.debug('Try flush {} archive {} with {} items'
                 .format(self.config['resource'], year, len(bulk_items)))
             try:
-                db = self.dbs[year]
+                archive_db = self.dbs[year]
                 start = time.time()
-                res = db.update(bulk_items.values())
+                res = archive_db.update(bulk_items.values())
                 end = time.time() - start
                 logger.debug('Bulk save archive {} duration: {} sec.'.format(year, end),
                              extra={'SAVE_BULK_DURATION': end})
@@ -626,9 +627,9 @@ class ResourceItemWorker(Greenlet):
                     if rev_or_exc.message in (u'Document update conflict.',
                                               u'New doc with oldest dateModified.'):
                         try:
-                            db_doc = db.get(doc_id)
                             bulk_doc = bulk_items[doc_id]
-                            if db_doc and db_doc['dateModified'] == bulk_doc['dateModified']:
+                            archive_doc = self._get_archive_doc(year, doc_id)
+                            if archive_doc and archive_doc['dateModified'] == bulk_doc['dateModified']:
                                 logger.info('Add stub for existing {}'.format(doc_id),
                                     extra={'MESSAGE_ID': 'add_stub_for_existing'})
                                 self.bulk[doc_id] = stub_archive[doc_id]
