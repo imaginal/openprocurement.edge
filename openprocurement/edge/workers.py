@@ -298,7 +298,7 @@ class ResourceItemWorker(Greenlet):
                 extra={'MESSAGE_ID': 'add_to_save_bulk'})
 
     def sync_archive_dbs(self):
-        logger.info('Start sync {} archives and main db.'
+        logger.info('Start check {} archive and main db.'
             .format(self.config['resource']),
             extra={'MESSAGE_ID': 'start_sync_archive'})
         try:
@@ -310,12 +310,12 @@ class ResourceItemWorker(Greenlet):
             logger.error('Error when sync archive {} and main: '
                 '{} {}'.format(year, type(e).__name__, e.message))
             raise
-        logger.info('End sync {} archives and main db.'
+        logger.info('End check {} archive and main db.'
             .format(self.config['resource']),
             extra={'MESSAGE_ID': 'end_sync_archive'})
 
     def _check_sync_needed(self, year, limit=50):
-        logger.info('Check sync {} archive {} and main'
+        logger.info('Checking that {} archive {} is synced with main db...'
             .format(self.config['resource'], year),
             extra={'MESSAGE_ID': 'check_sync_archive'})
         db = self.dbs[year]
@@ -338,7 +338,7 @@ class ResourceItemWorker(Greenlet):
         return False
 
     def _sync_main_from_archive(self, year):
-        logger.info('Start sync {} from archive {} to main db'
+        logger.info('Start sync {} from archive {} to main db...'
             .format(self.config['resource'], year),
             extra={'MESSAGE_ID': 'start_sync_archive'})
         db = self.dbs[year]
