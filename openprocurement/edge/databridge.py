@@ -47,7 +47,7 @@ WORKER_CONFIG = {
     'queue_timeout': 3,
     'archive_status': 'complete,cancelled,unsuccessful',
     'sync_worker_sleep': 5,
-    'sync_worker_stat': 1000,
+    'sync_worker_stat': 30,
     'bulk_save_limit': 1000,
     'bulk_save_interval': 5
 }
@@ -398,11 +398,15 @@ class EdgeDataBridge(object):
             filled_resource_items_queue = round(
                 self.resource_items_queue.qsize() /
                 (float(self.resource_items_queue_size) / 100), 2)
+            if filled_resource_items_queue < 0.0:
+                filled_resource_items_queue = 0
             logger.info('Resource items queue filled on {} %'.format(
                 filled_resource_items_queue))
             filled_retry_resource_items_queue \
                 = round(self.retry_resource_items_queue.qsize() / float(
                     self.retry_resource_items_queue_size) / 100, 2)
+            if filled_retry_resource_items_queue < 0.0:
+                filled_retry_resource_items_queue = 0
             logger.info('Retry resource items queue filled on {} %'.format(
                 filled_retry_resource_items_queue))
             sleep(self.queues_controller_timeout)

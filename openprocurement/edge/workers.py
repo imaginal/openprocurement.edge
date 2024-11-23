@@ -298,13 +298,25 @@ class ResourceItemWorker(Greenlet):
                 extra={'MESSAGE_ID': 'add_to_save_bulk'})
 
     def sync_archive_dbs(self):
-        for year in self.dbs:
-            if self._check_sync_needed(year):
-                self._sync_archive_and_main(year)
+        logger.info('Start sync {} archives and main db.'
+            .format(self.config['resource']),
+            extra={'MESSAGE_ID': 'start_sync_archive'})
+        try:
+            for year in self.dbs:
+                if self._check_sync_needed(year):
+                    logger.warning('Need sync archive {} and main db'.format(year))
+                    self._sync_main_from_archive(year)
+        except Exception as e:
+            logger.error('Error when sync archive {} and main: '
+                '{} {}'.format(year, type(e).__name__, e.message))
+            raise
+        logger.info('End sync {} archives and main db.'
+            .format(self.config['resource']),
+            extra={'MESSAGE_ID': 'end_sync_archive'})
 
     def _check_sync_needed(self, year, limit=50):
-        logger.info('Check sync of archive {} and main {}'
-            .format(year, self.config['resource']),
+        logger.info('Check sync {} archive {} and main'
+            .format(self.config['resource'], year),
             extra={'MESSAGE_ID': 'check_sync_archive'})
         db = self.dbs[year]
         main_db = self.db
@@ -313,30 +325,48 @@ class ResourceItemWorker(Greenlet):
             if doc['id'][:1] == '_':
                 continue
             if not main_db.get(doc['id']):
+                logger.error('Stub {} {} from archive {} not found in main db'
+                    .format(self.config['resource'][:-1], doc['id'], year))
                 return True
         for doc in db.view(view_path, limit=limit, descending=True):
             if doc['id'][:1] == '_':
                 continue
             if not main_db.get(doc['id']):
+                logger.error('Stub {} {} from archive {} not found in main db'
+                    .format(self.config['resource'][:-1], doc['id'], year))
                 return True
         return False
 
-    def _sync_archive_and_main(self, year):
-        logger.info('Start sync from archive {} to main {}'
-            .format(year, self.config['resource']),
+    def _sync_main_from_archive(self, year):
+        logger.info('Start sync {} from archive {} to main db'
+            .format(self.config['resource'], year),
             extra={'MESSAGE_ID': 'start_sync_archive'})
         db = self.dbs[year]
         main_db = self.db
         view_path = '_design/{}/_view/by_dateModified'.format(
             self.config['resource'])
-        self.exit = False
         self.archive = False
         stub_created = 0
-        for row in db.view(view_path):
+        stub_skipped = 0
+        count_rows = 0
+        stat_time = time.time()
+        view_results = db.view(view_path)
+        for row in view_results:
+            count_rows += 1
+            # print some statistics
+            if time.time() - stat_time > self.config.get('sync_main_stat', 30):
+                total_rows = view_results.total_rows
+                p = round(100.0 * count_rows / total_rows, 1)
+                logger.info('Sync {} archive {} to main: {:,} created, {:,} skipped, {:.1f}%'
+                    .format(self.config['resource'][:-1], year, stub_created, stub_skipped, p),
+                    extra={'MESSAGE_ID': 'sync_archive_progress'})
+                stat_time = time.time()
+            # process rows
             doc_id = row['id']
             doc = db.get(doc_id)
             stub = main_db.get(doc_id)
             if stub and stub['dateModified'] == doc['dateModified']:
+                stub_skipped += 1
                 continue
             logger.debug('Add stub from archive {} to main {} {}'
                 .format(year, self.config['resource'][:-1], doc_id),
@@ -344,19 +374,35 @@ class ResourceItemWorker(Greenlet):
             newstub = self._get_archive_stub(doc, year)
             if stub and '_rev' in stub:
                 newstub['_rev'] = stub['_rev']
+            # add new stub to bulk
             self.bulk[doc_id] = newstub
             self.priority_cache[doc_id] = 1
             self._save_bulk_docs()
             stub_created += 1
+        # flush leftovers
         if self.bulk:
-            self.exit = True
-            self._save_bulk_docs()
-            assert not self.bulk
-        logger.info('End sync archive {}, created {} {} stubs'
-            .format(year, stub_created, self.config['resource']),
+            self._save_bulk_docs(flush=True)
+            assert not self.bulk, 'Bulk queue is not empty'
+        logger.info('End sync {} archive {} to main: {:,} created, {:,} skipped'
+            .format(self.config['resource'][:-1], year, stub_created, stub_skipped),
             extra={'MESSAGE_ID': 'end_sync_archive'})
+        return stub_created
 
     def _run_sync_worker(self):
+        for n in range(10):
+            try:
+                return self._sync_main_to_archive()
+            except Exception as e:
+                logger.error('Error in sync archive worker: {} {} (try {})'
+                    .format(type(e).__name__, e.message, n),
+                    extra={'MESSAGE_ID': 'sync_worker_failed'})
+                if n == 9:
+                    raise
+                if self.exit:
+                    return
+                sleep(self.config.get('sync_worker_error_sleep', 30))
+
+    def _sync_main_to_archive(self):
         logger.info('Start sync from {} main to archive worker...'
             .format(self.config['resource']),
             extra={'MESSAGE_ID': 'start_sync_worker'})
@@ -365,11 +411,24 @@ class ResourceItemWorker(Greenlet):
         view_path = '_design/{}/_view/by_dateModified'.format(
             self.config['resource'])
         bulk_archive = {k: {} for k in self.dbs}
-        total_count = 0
+        rows_count = 0
         archive_count = 0
-        for row in main_db.view(view_path, descending=True):
+        stat_time = time.time()
+        view_results = main_db.view(view_path, descending=True)
+        for row in view_results:
             if self.exit:
                 break
+            # some statistics
+            rows_count += 1
+            if time.time() - stat_time > self.config['sync_worker_stat']:
+                total_rows = view_results.total_rows
+                p = round(100.0 * rows_count / total_rows, 1)
+                logger.info('Sync {} worker: {:,} processed {:,} in archive {:.1f}%'
+                    .format(self.config['resource'], rows_count, archive_count, p),
+                    extra={'MESSAGE_ID': 'sync_worker_timer'})
+                sleep(self.config['sync_worker_sleep'])
+                stat_time = time.time()
+            # process rows
             doc_id = row['id']
             doc = row['value']
             if 'archived' in doc:  # is archive stub
@@ -382,18 +441,11 @@ class ResourceItemWorker(Greenlet):
                 bulk_archive[year][doc_id] = row['key']
                 self._check_archive_bulk(bulk_archive, year)
                 archive_count += 1
-            # some statistics
-            total_count += 1
-            if total_count % self.config['sync_worker_stat'] == 0:
-                logger.info('Sync {} worker: {:,} processed {:,} in archive'
-                    .format(self.config['resource'], total_count, archive_count),
-                    extra={'MESSAGE_ID': 'sync_worker_timer'})
-                sleep(self.config['sync_worker_sleep'])
         # flush
         for year in self.dbs:
             self._check_archive_bulk(bulk_archive, year, 0)
         logger.info('End sync {} worker: {:,} processed {:,} in archive'
-            .format(self.config['resource'], total_count, archive_count),
+            .format(self.config['resource'], rows_count, archive_count),
             extra={'MESSAGE_ID': 'end_sync_worker'})
 
     def _check_archive_bulk(self, bulk_archive, year, limit=100):
@@ -436,10 +488,24 @@ class ResourceItemWorker(Greenlet):
                     doc['dateModified'] == archive_doc['dateModified']:
                 continue
             if doc and doc.get('archived'):  # is archive stub
-                logger.warning('Delete {} stub {} from main (missed in archive {})'
+                # maybe we can update stub
+                if archive_doc and archive_doc['dateModified'] > doc['dateModified']:
+                    newstub = self._get_archive_stub(archive_doc)
+                    newstub['_rev'] = doc['_rev']
+                    logger.warning('Update {} stub {} in main (from archive {})'
+                        .format(self.config['resource'][:-1], doc_id, year),
+                        extra={'MESSAGE_ID': 'update_main_stub'})
+                    if self.db.save(newstub):
+                        continue
+                # update not possible or failed, now delete
+                logger.warning('Delete {} stub {} from main (missmatch with archive {})'
                     .format(self.config['resource'][:-1], doc_id, year),
                     extra={'MESSAGE_ID': 'delete_from_main'})
                 self.db.delete(doc)
+            elif doc:
+                logger.error('Not archived {} {} in sync with archive {}'
+                    .format(doc.get('doc_type', '<doc_type>'), doc_id, year),
+                    extra={'MESSAGE_ID': 'error_not_archived_doc'})
             if self.delete_from_archive and archive_doc:
                 logger.warning('Delete {} {} from arhicve {} (missed stub in main)'
                     .format(self.config['resource'][:-1], doc_id, year),
@@ -584,11 +650,11 @@ class ResourceItemWorker(Greenlet):
                         '{}'.format(self.config['resource'][:-1],
                                     doc_id, year, rev_or_exc.message))
 
-    def _save_bulk_docs(self):
+    def _save_bulk_docs(self, flush=False):
         if (len(self.bulk) > self.bulk_save_limit or
                 (datetime.now() - self.start_time).total_seconds() >
-                self.bulk_save_interval or self.exit):
-            if self.archive and self.api_clients_queue:
+                self.bulk_save_interval or self.exit or flush):
+            if self.archive:
                 self._save_bulk_archive()
             if len(self.bulk) == 0:
                 return
