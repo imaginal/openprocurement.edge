@@ -1,6 +1,6 @@
 function(doc) {
     if(doc.doc_type == 'Tender') {
-        var fields=['archived', 'dateModified', 'status'], data={};
+        var fields=['archive_stub', 'dateModified', 'status'], data={};
         for (var i in fields) {
             if (doc[fields[i]]) {
                 data[fields[i]] = doc[fields[i]]
