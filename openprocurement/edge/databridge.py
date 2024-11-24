@@ -77,7 +77,7 @@ DEFAULTS = {
     'couch_url': 'http://127.0.0.1:5984',
     'db_name': 'edge_db',
     'archive': False,
-    'sync_archive': 'yes',
+    'push_views': False,
     'perfomance_window': 300
 }
 
@@ -158,7 +158,8 @@ class EdgeDataBridge(object):
         logger.info('Open database {}'.format(self.db_name))
         self.db = prepare_couchdb(self.couch_url, self.db_name, logger)
         db_url = self.couch_url + '/' + self.db_name
-        prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
+        if self.config['push_views']:
+            prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
         self.server = Server(self.couch_url,
                              session=Session(retry_delays=range(10)))
         self.view_path = '_design/{}/_view/by_dateModified'.format(
@@ -189,7 +190,8 @@ class EdgeDataBridge(object):
             logger.info('Open archive: {}'.format(db_name))
             self.dbs[year] = prepare_couchdb(self.couch_url, db_name, logger)
             db_url = self.couch_url + '/' + db_name
-            prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
+            if self.config['push_views']:
+                prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
 
     def config_get(self, name):
         try:
