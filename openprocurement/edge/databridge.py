@@ -78,6 +78,7 @@ DEFAULTS = {
     'db_name': 'edge_db',
     'archive': False,
     'push_views': False,
+    'push_archive_views': False,
     'perfomance_window': 300
 }
 
@@ -158,7 +159,7 @@ class EdgeDataBridge(object):
         logger.info('Open database {}'.format(self.db_name))
         self.db = prepare_couchdb(self.couch_url, self.db_name, logger)
         db_url = self.couch_url + '/' + self.db_name
-        if self.config['push_views']:
+        if self.push_views:
             prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
         self.server = Server(self.couch_url,
                              session=Session(retry_delays=range(10)))
@@ -187,10 +188,10 @@ class EdgeDataBridge(object):
         for year in self.archive:
             year = str(year)
             db_name = self.db_name + '_' + year
-            logger.info('Open archive: {}'.format(db_name))
+            logger.info('Open archive database: {}'.format(db_name))
             self.dbs[year] = prepare_couchdb(self.couch_url, db_name, logger)
             db_url = self.couch_url + '/' + db_name
-            if self.config['push_views']:
+            if self.push_archive_views:
                 prepare_couchdb_views(db_url, self.workers_config['resource'], logger)
 
     def config_get(self, name):
