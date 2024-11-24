@@ -371,12 +371,16 @@ class ResourceItemWorker(Greenlet):
             logger.debug('Add stub from archive {} to main {} {}'
                 .format(year, self.config['resource'][:-1], doc_id),
                 extra={'MESSAGE_ID': 'add_stub_from_archive'})
-            archive_doc = self._get_archive_doc(year, doc_id)
-            newstub = self._get_archive_stub(archive_doc, year)
+            try:
+                new_stub = self._get_stub_from_view_row(row, year)
+            except (KeyError, TypeError, AttributeError, AssertionError):
+                logger.error('Error creating stub from row {}'.format(row))
+                archive_doc = self._get_archive_doc(year, doc_id)
+                new_stub = self._get_archive_stub(archive_doc)
             if stub and '_rev' in stub:
-                newstub['_rev'] = stub['_rev']
+                new_stub['_rev'] = stub['_rev']
             # add new stub to bulk
-            self.bulk[doc_id] = newstub
+            self.bulk[doc_id] = new_stub
             self.priority_cache[doc_id] = 1
             self._save_bulk_docs()
             stub_created += 1
@@ -395,7 +399,7 @@ class ResourceItemWorker(Greenlet):
                 return self._sync_main_to_archive()
             except Exception as e:
                 logger.error('Error in sync archive worker: {} {} (try {})'
-                    .format(type(e).__name__, e.message, n),
+                    .format(type(e).__name__, e.message, n + 1),
                     extra={'MESSAGE_ID': 'sync_worker_failed'})
                 if n == 9:
                     raise
@@ -491,12 +495,12 @@ class ResourceItemWorker(Greenlet):
             if doc and doc.get('archived'):  # is archive stub
                 # maybe we can update stub
                 if archive_doc and archive_doc['dateModified'] > doc['dateModified']:
-                    newstub = self._get_archive_stub(archive_doc)
-                    newstub['_rev'] = doc['_rev']
+                    new_stub = self._get_archive_stub(archive_doc)
+                    new_stub['_rev'] = doc['_rev']
                     logger.warning('Update {} stub {} in main (from archive {})'
                         .format(self.config['resource'][:-1], doc_id, year),
                         extra={'MESSAGE_ID': 'update_main_stub'})
-                    if self.db.save(newstub):
+                    if self.db.save(new_stub):
                         continue
                 # update not possible or failed, now delete
                 logger.warning('Delete {} stub {} from main (missmatch with archive {})'
@@ -519,9 +523,8 @@ class ResourceItemWorker(Greenlet):
         bulk_archive[year] = {}
 
     def _is_archive_doc(self, doc):
-        if doc.get('status') in self.archive_status:
-            return True
-        return False
+        return not doc.get('archived') and \
+            doc.get('status') in self.archive_status
 
     def _get_archive_year(self, doc):
         if 'archived' in doc:
@@ -545,6 +548,23 @@ class ResourceItemWorker(Greenlet):
                 stub[k] = doc[k]
         return stub
 
+    def _get_stub_from_view_row(self, row, year):
+        keyid = self.config['resource'][:-1] + 'ID'
+        doc_type = self.config['resource'][:-1].title()
+        resource_id = row['value'].get(keyid, row['key'])
+        date_modified = row['value'].get('dateModified', row['key'])
+        doc = {
+            '_id': row['id'],
+            'id': row['id'],
+            'doc_type': doc_type,
+            'status': row['value']['status'],
+            'dateModified': date_modified,
+            keyid: resource_id
+        }
+        assert doc[keyid][:2] == 'UA'
+        assert doc['dateModified'][:2] == '20'
+        return self._get_archive_stub(doc, year)
+
     def _get_archive_doc(self, year, doc_id):
         for n in range(5):
             try:
@@ -557,41 +577,42 @@ class ResourceItemWorker(Greenlet):
                     raise
                 sleep(1 + 2 * n)
 
-    def _save_bulk_archive(self):
+    def _save_bulk_to_archive(self):
         bulk_archive = {}
         stub_archive = {}
         # fill archive queues
         for doc_id, doc in self.bulk.items():
-            if self._is_archive_doc(doc):
-                year = self._get_archive_year(doc)
-                if year not in self.dbs:
-                    logger.error('No archive {} for {} {}'.format(
-                        year, self.config['resource'][:-1], doc_id))
-                    continue
-                if year not in bulk_archive:
-                    bulk_archive[year] = {}
-                archive_doc = None
-                doc_rev = doc.pop('_rev', None)
-                stub = self._get_archive_stub(doc, year)
-                if doc_rev:
-                    stub['_rev'] = doc_rev
-                    archive_doc = self._get_archive_doc(year, doc_id)
-                elif self.exists_in_archive.get(doc_id):
-                    self.exists_in_archive.pop(doc_id)
-                    archive_doc = self._get_archive_doc(year, doc_id)
-                elif self.priority_cache[doc_id] > 1:
-                    archive_doc = self._get_archive_doc(year, doc_id)
-                if archive_doc:
-                    doc['_rev'] = archive_doc['_rev']
-                    changes = archive_doc.pop('changes', [])
-                    patch = make_patch(doc, archive_doc)
-                    if patch and patch.patch:
-                        changes.insert(0, patch.patch)
-                    doc['changes'] = changes
-                    logger.warning('Update archive {} {} {} rev {}'.format(
-                        year, self.config['resource'][:-1], doc_id, doc['_rev']))
-                bulk_archive[year][doc_id] = doc
-                stub_archive[doc_id] = stub
+            if not self._is_archive_doc(doc):
+                continue
+            year = self._get_archive_year(doc)
+            if year not in self.dbs:
+                logger.error('No archive {} for {} {}'.format(
+                    year, self.config['resource'][:-1], doc_id))
+                continue
+            if year not in bulk_archive:
+                bulk_archive[year] = {}
+            archive_doc = None
+            doc_rev = doc.pop('_rev', None)
+            stub = self._get_archive_stub(doc, year)
+            if doc_rev:
+                stub['_rev'] = doc_rev
+                archive_doc = self._get_archive_doc(year, doc_id)
+            elif self.exists_in_archive.get(doc_id):
+                self.exists_in_archive.pop(doc_id)
+                archive_doc = self._get_archive_doc(year, doc_id)
+            elif self.priority_cache[doc_id] > 1:
+                archive_doc = self._get_archive_doc(year, doc_id)
+            if archive_doc:
+                doc['_rev'] = archive_doc['_rev']
+                changes = archive_doc.pop('changes', [])
+                patch = make_patch(doc, archive_doc)
+                if patch and patch.patch:
+                    changes.insert(0, patch.patch)
+                doc['changes'] = changes
+                logger.warning('Update archive {} {} {} rev {}'.format(
+                    year, self.config['resource'][:-1], doc_id, doc['_rev']))
+            bulk_archive[year][doc_id] = doc
+            stub_archive[doc_id] = stub
         # flush archive queues
         for year, bulk_items in bulk_archive.items():
             logger.debug('Try flush {} archive {} with {} items'
@@ -656,7 +677,7 @@ class ResourceItemWorker(Greenlet):
                 (datetime.now() - self.start_time).total_seconds() >
                 self.bulk_save_interval or self.exit or flush):
             if self.archive:
-                self._save_bulk_archive()
+                self._save_bulk_to_archive()
             if len(self.bulk) == 0:
                 return
             try:
