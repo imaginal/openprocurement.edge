@@ -189,16 +189,17 @@ def extract_doc_adapter(request, doc_id, doc_type):
     doc = {}
     if doc_id.startswith(HUMAN_ID_PREFIX):
         view_path = '_design/{}s/_view/all'.format(doc_type.lower())
-        for row in db.view(view_path, keys=[doc_id], limit=1):
-            doc_id = row['id']
-            doc = row['value']
-    if not doc.get('archived'):
+        for row in db.view(view_path, key=doc_id, limit=1):
+            if row and 'value' in row:
+                doc_id = row['id']
+                doc = row['value']
+    if not doc.get('archive_stub'):
         doc = db.get(doc_id)
-    if doc and 'archived' in doc and doc['archived'] in request.registry.dbs:
-        year = doc['archived']
+    if doc and doc.get('archive_stub') in request.registry.dbs:
+        year = doc['archive_stub']
         db = request.registry.dbs[year]
         doc = db.get(doc_id)
-    if doc is None or doc.get('doc_type') != doc_type or doc.get('archived'):
+    if doc is None or doc.get('doc_type') != doc_type or doc.get('archive_stub'):
         request.errors.add('url', '{}_id'.format(doc_type.lower()), 'Not Found')
         request.errors.status = 404
         raise error_handler(request.errors)

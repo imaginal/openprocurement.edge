@@ -13,7 +13,7 @@ from gevent.queue import Empty
 from iso8601 import parse_date
 from pytz import timezone
 from couchdb import http
-from openprocurement.edge.utils import make_patch
+from openprocurement.edge.utils import get_now, make_patch
 from requests.exceptions import ConnectionError
 from openprocurement_client.exceptions import (
     InvalidResponse,
@@ -315,6 +315,7 @@ class ResourceItemWorker(Greenlet):
             extra={'MESSAGE_ID': 'end_sync_archive'})
 
     def _check_sync_needed(self, year, limit=50):
+        # simple and super fast 99% correct check for exist stubs w/o check dateModified
         logger.info('Check sync {} archive {} and main db...'
             .format(self.config['resource'], year),
             extra={'MESSAGE_ID': 'check_sync_archive'})
@@ -333,9 +334,9 @@ class ResourceItemWorker(Greenlet):
             return False
         # find same docs in main db, stop on first not found or deleted
         for doc in main_db.view(view_path, keys=docs_to_check.keys()):
-            if not doc.get('value') or doc['value'].get('deleted'):
+            if not doc.get('id') or not doc.get('value') or doc['value'].get('deleted'):
                 logger.error('Stub for {} {} from archive {} not found in main db'
-                    .format(self.config['resource'][:-1], doc.get('id'), year))
+                    .format(self.config['resource'][:-1], doc.get('key'), year))
                 return True
             docs_to_check.pop(doc['id'])
         for doc_id in docs_to_check:
@@ -384,7 +385,7 @@ class ResourceItemWorker(Greenlet):
             extra={'MESSAGE_ID': 'end_sync_archive'})
 
     def _check_main_bulk(self, archive_rows, year, limit=100):
-        if len(archive_rows) < limit:
+        if not archive_rows or len(archive_rows) < limit:
             return
         # check by dates
         main_db = self.db
@@ -451,10 +452,16 @@ class ResourceItemWorker(Greenlet):
     def _run_sync_worker(self):
         for n in range(10):
             try:
-                return self._sync_main_to_archive()
+                self._sync_main_to_archive()
+                # restart worker if it finished with errors
+                if self.sync_worker_errors > 0:
+                    raise Exception('worekr has {} errors'.format(
+                        self.sync_worker_errors))
+                break
             except Exception as e:
-                logger.error('Error in sync archive worker: {} {} (try {})'
-                    .format(type(e).__name__, e.message, n + 1),
+                logger.error('Error in sync {} archive worker: {} {} '
+                    '(try {})'.format(self.config['resource'],
+                        type(e).__name__, e.message, n + 1),
                     extra={'MESSAGE_ID': 'sync_worker_failed'})
                 if n == 9:
                     raise
@@ -466,6 +473,7 @@ class ResourceItemWorker(Greenlet):
         logger.info('Start sync from {} main to archive worker...'
             .format(self.config['resource']),
             extra={'MESSAGE_ID': 'start_sync_worker'})
+        self.sync_worker_errors = 0
         self.sync_archive_priority = 1
         main_db = self.db
         view_path = '_design/{}/_view/by_dateModified'.format(
@@ -489,9 +497,13 @@ class ResourceItemWorker(Greenlet):
                 sleep(self.config['sync_worker_sleep'])
                 stat_time = time.time()
             # process rows
+            if not row or 'id' not in row or 'value' not in row:
+                logger.warning('Bad row {} in view {} offset {}'.format(
+                    row, view_path, rows_count))
+                continue
             doc_id = row['id']
             doc = row['value']
-            if 'archived' in doc:  # is archive stub
+            if 'archive_stub' in doc:  # is archive stub
                 year = self._get_archive_year(doc)
                 if year not in self.dbs:
                     logger.error('No archive for {} {} {}'
@@ -501,6 +513,10 @@ class ResourceItemWorker(Greenlet):
                 bulk_archive[year][doc_id] = row['key']
                 self._check_archive_bulk(bulk_archive, year)
                 archive_count += 1
+            elif self._is_archive_doc(doc):
+                logger.warning('Found not archived {} {} status {}'.format(
+                    self.config['resource'][:-1], doc_id, doc['status']))
+                self._move_to_achive(doc_id)
         # flush
         for year in sorted(self.dbs.keys()):
             self._check_archive_bulk(bulk_archive, year, limit=0)
@@ -508,11 +524,44 @@ class ResourceItemWorker(Greenlet):
             .format(self.config['resource'], rows_count, archive_count),
             extra={'MESSAGE_ID': 'end_sync_worker'})
 
-    def _check_archive_bulk(self, bulk_archive, year, limit=100):
-        if len(bulk_archive[year]) < limit:
+    def _move_to_achive(self, doc_id):
+        doc = self.db.get(doc_id)
+        if not self._is_archive_doc(doc):
             return
-        logger.info('Check {} archive {} with {} items'
-            .format(self.config['resource'][:-1], year, len(bulk_archive[year])),
+        year = self._get_archive_year(doc)
+        if year not in self.dbs:
+            return
+        archive_db = self.dbs[year]
+        archive_doc = archive_db.get(doc_id)
+        doc_rev = doc.pop('_rev')
+        if archive_doc and archive_doc.get('_rev'):
+            doc['_rev'] = archive_doc['_rev']
+        try:
+            archive_db.save(doc)
+        except Exception as e:
+            logger.error('Error on save {} {} to archive {}: {}'.format(
+                self.config['resource'][:-1], doc_id, year, e.message))
+            self.sync_worker_errors += 1
+            return
+        # restore rev for delete
+        doc['_rev'] = doc_rev
+        stub = self._get_archive_stub(doc)
+        try:
+            self.db.delete(doc)
+            self.db.save(stub)
+        except Exception as e:
+            logger.error('Error on save stub {} {} to main db: {}'.format(
+                self.config['resource'][:-1], doc_id, e.message))
+            self.sync_worker_errors += 1
+            return
+        logger.info('Moved {} {} to archive {}'.format(
+            self.config['resource'][:-1], doc_id, year))
+
+    def _check_archive_bulk(self, bulk_archive, year, limit=100):
+        if not bulk_archive[year] or len(bulk_archive[year]) < limit:
+            return
+        logger.info('Check {} archive {} with {} items'.format(
+            self.config['resource'][:-1], year, len(bulk_archive[year])),
             extra={'MESSAGE_ID': 'check_archive'})
         archive_db = self.dbs[year]
         view_path = '_design/{}/_view/by_dateModified'.format(
@@ -534,6 +583,7 @@ class ResourceItemWorker(Greenlet):
                     'in {} archive {} error {}'.format(n + 1, len(bulk_values),
                         self.config['resource'], year, e.message),
                     extra={'MESSAGE_ID': 'exceptions'})
+                self.sync_worker_errors += 1
                 if n > 3:
                     raise
                 sleep(1 + 2 * n)
@@ -547,7 +597,7 @@ class ResourceItemWorker(Greenlet):
             if doc and archive_doc and doc.get('dateModified') and \
                     doc['dateModified'] == archive_doc['dateModified']:
                 continue
-            if doc and doc.get('archived'):  # is archive stub
+            if doc and doc.get('archive_stub'):  # is archive stub
                 # maybe we can update stub
                 if archive_doc and archive_doc['dateModified'] > doc['dateModified']:
                     new_stub = self._get_archive_stub(archive_doc)
@@ -555,22 +605,37 @@ class ResourceItemWorker(Greenlet):
                     logger.warning('Update {} stub {} in main (from archive {})'
                         .format(self.config['resource'][:-1], doc_id, year),
                         extra={'MESSAGE_ID': 'update_main_stub'})
-                    if self.db.save(new_stub):
-                        continue
+                    try:
+                        if self.db.save(new_stub):
+                            continue
+                    except Exception as e:
+                        logger.error('Error on update {} stub {} {}'.format(
+                            self.config['resource'][:-1], new_stub['id'], e.message))
+                        self.sync_worker_errors += 1
                 # update not possible or failed, now delete
                 logger.warning('Delete {} stub {} from main (missmatch with archive {})'
                     .format(self.config['resource'][:-1], doc_id, year),
                     extra={'MESSAGE_ID': 'delete_from_main'})
-                self.db.delete(doc)
-            elif doc:
-                logger.error('Not archived {} {} in sync with archive {}'
+                try:
+                    self.db.delete(doc)
+                except Exception as e:
+                    logger.error('Error on delete {} stub {} {}'.format(
+                        self.config['resource'][:-1], doc['id'], e.message))
+                    self.sync_worker_errors += 1
+            elif doc:  # it should newer happens
+                logger.error('Not archived {} {} must be in archive {}'
                     .format(doc.get('doc_type', '<doc_type>'), doc_id, year),
                     extra={'MESSAGE_ID': 'error_not_archived_doc'})
             if self.delete_from_archive and archive_doc:
                 logger.warning('Delete {} {} from arhicve {} (missed stub in main)'
                     .format(self.config['resource'][:-1], doc_id, year),
                     extra={'MESSAGE_ID': 'delete_from_archive'})
-                archive_db.delete(archive_doc)
+                try:
+                    archive_db.delete(archive_doc)
+                except Exception as e:
+                    logger.error('Error on delete {} {} from archive {}: {}'.format(
+                        self.config['resource'][:-1], doc['id'], year, e.message))
+                    self.sync_worker_errors += 1
             elif archive_doc:
                 self.exists_in_archive[doc_id] = True
             self.add_to_retry_queue(doc_id, self.sync_archive_priority)
@@ -578,12 +643,12 @@ class ResourceItemWorker(Greenlet):
         bulk_archive[year] = {}
 
     def _is_archive_doc(self, doc):
-        return not doc.get('archived') and \
+        return not doc.get('archive_stub') and \
             doc.get('status') in self.archive_status
 
     def _get_archive_year(self, doc):
-        if 'archived' in doc:
-            return doc['archived']
+        if 'archive_stub' in doc:
+            return doc['archive_stub']
         keyid = self.config['resource'][:-1] + 'ID'
         parts = doc.get(keyid, '').split('-')
         if len(parts) < 5:
@@ -597,7 +662,7 @@ class ResourceItemWorker(Greenlet):
         fields = ['_id', 'id', 'doc_type', 'status', 'dateModified', keyid]
         if not year:
             year = self._get_archive_year(doc)
-        stub = {'archived': year}
+        stub = {'archive_stub': year}
         for k in fields:
             if k in doc:
                 stub[k] = doc[k]
