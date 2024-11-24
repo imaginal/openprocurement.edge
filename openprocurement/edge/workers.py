@@ -335,12 +335,12 @@ class ResourceItemWorker(Greenlet):
         for doc in main_db.view(view_path, keys=docs_to_check.keys()):
             if not doc.get('value') or doc['value'].get('deleted'):
                 logger.error('Stub for {} {} from archive {} not found in main db'
-                    .format(self.config['resource'][:-1], doc['id'], year))
+                    .format(self.config['resource'][:-1], doc.get('id'), year))
                 return True
             docs_to_check.pop(doc['id'])
-        for doc in docs_to_check.values():
+        for doc_id in docs_to_check:
             logger.error('Stub for {} {} from archive {} not found in main db'
-                .format(self.config['resource'][:-1], doc['id'], year))
+                .format(self.config['resource'][:-1], doc_id, year))
             return True
         return False
 
